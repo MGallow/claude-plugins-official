@@ -423,6 +423,59 @@ const SEND_FILE_SCRIPT = `on run argv
   tell application "Messages" to send (POSIX file (item 1 of argv)) to chat id (item 2 of argv)
 end run`
 
+// Tahoe changed chat GUIDs from `iMessage;-;` to `any;-;` in chat.db, but
+// AppleScript's `chat id "iMessage;-;..."` lookup fails in Tahoe (-1728).
+// Instead, find the existing 1:1 iMessage chat by participant handle so we
+// reply into the correct thread. Falls back to buddy (new thread) only if no
+// matching chat exists yet.
+const SEND_BUDDY_SCRIPT = `on run argv
+  tell application "Messages"
+    set msgText to item 1 of argv
+    set targetHandle to item 2 of argv
+    set imsvc to 1st service whose service type = iMessage
+    set sentOk to false
+    repeat with c in (every chat of imsvc)
+      try
+        set plist to participants of c
+        if (count of plist) is 1 then
+          if handle of (item 1 of plist) is targetHandle then
+            send msgText to c
+            set sentOk to true
+            exit repeat
+          end if
+        end if
+      end try
+    end repeat
+    if not sentOk then
+      send msgText to buddy targetHandle of imsvc
+    end if
+  end tell
+end run`
+
+const SEND_FILE_BUDDY_SCRIPT = `on run argv
+  tell application "Messages"
+    set msgFile to POSIX file (item 1 of argv)
+    set targetHandle to item 2 of argv
+    set imsvc to 1st service whose service type = iMessage
+    set sentOk to false
+    repeat with c in (every chat of imsvc)
+      try
+        set plist to participants of c
+        if (count of plist) is 1 then
+          if handle of (item 1 of plist) is targetHandle then
+            send msgFile to c
+            set sentOk to true
+            exit repeat
+          end if
+        end if
+      end try
+    end repeat
+    if not sentOk then
+      send msgFile to buddy targetHandle of imsvc
+    end if
+  end tell
+end run`
+
 // Echo filter for self-chat. osascript gives no GUID back, so we match on
 // (chat, normalised-text) within a short window. '\x00att' keys attachment sends.
 // Normalise aggressively: macOS Messages can mangle whitespace, smart-quote,
@@ -457,8 +510,11 @@ function consumeEcho(chatGuid: string, key: string): boolean {
 }
 
 function sendText(chatGuid: string, text: string): string | null {
-  const res = spawnSync('osascript', ['-', text, chatGuid], {
-    input: SEND_SCRIPT,
+  const isAny = chatGuid.startsWith('any;-;')
+  const script = isAny ? SEND_BUDDY_SCRIPT : SEND_SCRIPT
+  const arg2 = isAny ? chatGuid.slice('any;-;'.length) : chatGuid
+  const res = spawnSync('osascript', ['-', text, arg2], {
+    input: script,
     encoding: 'utf8',
   })
   if (res.status !== 0) return res.stderr.trim() || `osascript exit ${res.status}`
@@ -467,8 +523,11 @@ function sendText(chatGuid: string, text: string): string | null {
 }
 
 function sendAttachment(chatGuid: string, filePath: string): string | null {
-  const res = spawnSync('osascript', ['-', filePath, chatGuid], {
-    input: SEND_FILE_SCRIPT,
+  const isAny = chatGuid.startsWith('any;-;')
+  const script = isAny ? SEND_FILE_BUDDY_SCRIPT : SEND_FILE_SCRIPT
+  const arg2 = isAny ? chatGuid.slice('any;-;'.length) : chatGuid
+  const res = spawnSync('osascript', ['-', filePath, arg2], {
+    input: script,
     encoding: 'utf8',
   })
   if (res.status !== 0) return res.stderr.trim() || `osascript exit ${res.status}`
