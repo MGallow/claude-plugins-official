@@ -423,56 +423,25 @@ const SEND_FILE_SCRIPT = `on run argv
   tell application "Messages" to send (POSIX file (item 1 of argv)) to chat id (item 2 of argv)
 end run`
 
-// Tahoe changed chat GUIDs from `iMessage;-;` to `any;-;` in chat.db, but
-// AppleScript's `chat id "iMessage;-;..."` lookup fails in Tahoe (-1728).
-// Instead, find the existing 1:1 iMessage chat by participant handle so we
-// reply into the correct thread. Falls back to buddy (new thread) only if no
-// matching chat exists yet.
-const SEND_BUDDY_SCRIPT = `on run argv
+// Fallback scripts for macOS Tahoe "any;-;" GUIDs where chat id lookup fails
+// for email-based Apple IDs. Sends via buddy address on the iMessage service
+// rather than chat GUID — iMessage-only, never SMS.
+const SEND_SCRIPT_BUDDY = `on run argv
+  set theText to item 1 of argv
+  set theAddress to item 2 of argv
   tell application "Messages"
-    set msgText to item 1 of argv
-    set targetHandle to item 2 of argv
-    set imsvc to 1st service whose service type = iMessage
-    set sentOk to false
-    repeat with c in (every chat of imsvc)
-      try
-        set plist to participants of c
-        if (count of plist) is 1 then
-          if handle of (item 1 of plist) is targetHandle then
-            send msgText to c
-            set sentOk to true
-            exit repeat
-          end if
-        end if
-      end try
-    end repeat
-    if not sentOk then
-      send msgText to buddy targetHandle of imsvc
-    end if
+    set targetService to 1st service whose service type = iMessage
+    set targetBuddy to buddy theAddress of targetService
+    send theText to targetBuddy
   end tell
 end run`
 
-const SEND_FILE_BUDDY_SCRIPT = `on run argv
+const SEND_FILE_SCRIPT_BUDDY = `on run argv
+  set theAddress to item 2 of argv
   tell application "Messages"
-    set msgFile to POSIX file (item 1 of argv)
-    set targetHandle to item 2 of argv
-    set imsvc to 1st service whose service type = iMessage
-    set sentOk to false
-    repeat with c in (every chat of imsvc)
-      try
-        set plist to participants of c
-        if (count of plist) is 1 then
-          if handle of (item 1 of plist) is targetHandle then
-            send msgFile to c
-            set sentOk to true
-            exit repeat
-          end if
-        end if
-      end try
-    end repeat
-    if not sentOk then
-      send msgFile to buddy targetHandle of imsvc
-    end if
+    set targetService to 1st service whose service type = iMessage
+    set targetBuddy to buddy theAddress of targetService
+    send (POSIX file (item 1 of argv)) to targetBuddy
   end tell
 end run`
 
@@ -509,28 +478,50 @@ function consumeEcho(chatGuid: string, key: string): boolean {
   return true
 }
 
+// macOS Tahoe changed chat GUID prefix from "iMessage;-;" to "any;-;".
+// AppleScript's "chat id" only recognizes "iMessage" and "SMS" prefixes.
+function appleScriptGuid(guid: string): string {
+  return guid.startsWith('any;-;') ? 'iMessage;-;' + guid.slice('any;-;'.length) : guid
+}
+
+// Extract the bare handle from a chat GUID (e.g. "any;-;you@example.com" → "you@example.com").
+function addressFromGuid(guid: string): string {
+  return guid.replace(/^(any|iMessage|SMS);-;/, '')
+}
+
 function sendText(chatGuid: string, text: string): string | null {
-  const isAny = chatGuid.startsWith('any;-;')
-  const script = isAny ? SEND_BUDDY_SCRIPT : SEND_SCRIPT
-  const arg2 = isAny ? chatGuid.slice('any;-;'.length) : chatGuid
-  const res = spawnSync('osascript', ['-', text, arg2], {
-    input: script,
+  const res = spawnSync('osascript', ['-', text, appleScriptGuid(chatGuid)], {
+    input: SEND_SCRIPT,
     encoding: 'utf8',
   })
-  if (res.status !== 0) return res.stderr.trim() || `osascript exit ${res.status}`
+  if (res.status !== 0) {
+    // Fallback for macOS Tahoe "any;-;" GUIDs: chat id lookup can fail for
+    // email Apple IDs. Retry via buddy address, iMessage service only.
+    if (!chatGuid.startsWith('any;-;')) return res.stderr.trim() || `osascript exit ${res.status}`
+    const res2 = spawnSync('osascript', ['-', text, addressFromGuid(chatGuid)], {
+      input: SEND_SCRIPT_BUDDY,
+      encoding: 'utf8',
+    })
+    if (res2.status !== 0) return res2.stderr.trim() || `osascript exit ${res2.status}`
+  }
   trackEcho(chatGuid, text)
   return null
 }
 
 function sendAttachment(chatGuid: string, filePath: string): string | null {
-  const isAny = chatGuid.startsWith('any;-;')
-  const script = isAny ? SEND_FILE_BUDDY_SCRIPT : SEND_FILE_SCRIPT
-  const arg2 = isAny ? chatGuid.slice('any;-;'.length) : chatGuid
-  const res = spawnSync('osascript', ['-', filePath, arg2], {
-    input: script,
+  const res = spawnSync('osascript', ['-', filePath, appleScriptGuid(chatGuid)], {
+    input: SEND_FILE_SCRIPT,
     encoding: 'utf8',
   })
-  if (res.status !== 0) return res.stderr.trim() || `osascript exit ${res.status}`
+  if (res.status !== 0) {
+    // Fallback for macOS Tahoe "any;-;" GUIDs: same as sendText.
+    if (!chatGuid.startsWith('any;-;')) return res.stderr.trim() || `osascript exit ${res.status}`
+    const res2 = spawnSync('osascript', ['-', filePath, addressFromGuid(chatGuid)], {
+      input: SEND_FILE_SCRIPT_BUDDY,
+      encoding: 'utf8',
+    })
+    if (res2.status !== 0) return res2.stderr.trim() || `osascript exit ${res2.status}`
+  }
   trackEcho(chatGuid, '\x00att')
   return null
 }
